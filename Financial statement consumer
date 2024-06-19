@@ -1,0 +1,265 @@
+
+
+@Slf4j
+public class FinancialStatementConsumer {
+
+    @Inject
+    DynamoSubmissionStore store;
+    @Inject
+    S3Service s3Service;
+    @Inject
+    SqsService sqsService;
+    @Inject
+    HttpService httpService;
+    @Inject
+    FinancialStatementTransformer transformer;
+
+    @Inject
+    DocumentExtractionTemplateUtil documentExtractionTemplateUtil;
+
+    @ConfigProperty(name = "AWS_S3_BUCKET_NAME")
+    String bucketName;
+
+    @Blocking
+    @ConsumeEvent("TRANSFORM_FINANCIAL_STATEMENT")
+    public void TransformFinancialStatement(ConsumerEvent event) {
+        log.info("Transforming Financial Statement for a request with id of: {}", event.getSubmissionId());
+
+        try {
+            SubmissionDocument document = await(store.getDocument(event.getOrgId(), event.getSubmissionId(), Prefix.DOCUMENT_FINANCIAL_STATEMENT));
+
+            CompositeKey documentKey = CompositeKey.builder()
+                    .pk(document.getPk())
+                    .sk(document.getSk())
+                    .build();
+
+            // Upload transformed result into S3
+            String transformedPath = transformer.transform(document);
+
+            // Update Financial Statement Document
+            await(store.updateDocument(documentKey, UpdateDocument.builder()
+                    .transformedPath(transformedPath)
+                    .build())
+            );
+        } catch (Exception ex) {
+            log.error("Financial Statement Transformer [Exception]:", ex);
+        }
+    }
+
+    @Blocking
+    @ConsumeEvent("PROCESS_FINANCIAL_STATEMENT")
+    public void ProcessFinancialStatement(ConsumerEvent event) {
+        log.info("Processing Financial Statement for a request with id of: {}", event.getSubmissionId());
+
+        SubmissionDocument document = await(store.getDocument(event.getOrgId(), event.getSubmissionId(), Prefix.DOCUMENT_FINANCIAL_STATEMENT));
+        SubmissionProfile profile = await(store.getProfile(event.getOrgId(), event.getSubmissionId()));
+
+        CompositeKey documentKey = CompositeKey.builder()
+                .pk(document.getPk())
+                .sk(document.getSk())
+                .build();
+        CompositeKey profileKey = CompositeKey.builder()
+                .pk(profile.getPk())
+                .sk(profile.getSk())
+                .build();
+
+        try {
+            Uni<List<SubmissionFile>> filesPromise = store.listFiles(
+                    document.getOrgId(), document.getSubmissionId(), Prefix.FILE_FINANCIAL_STATEMENT, SubmissionStatus.IN_REVIEW).collect().asList();
+
+            List<SubmissionFile> files = await(filesPromise);
+
+            for (SubmissionFile file : files) {
+                // Create Financial Statement Result
+                SubmissionResult result = resultBuilder(file.getIdentifier())
+                        .orgId(document.getOrgId())
+                        .submissionId(document.getSubmissionId())
+                        .createdBy(document.getCreatedBy())
+                        .status(SubmissionStatus.PROCESSING)
+                        .build();
+
+                store.createResult(result).subscribe().with(
+                        success -> log.info("Submission Result created: {}", result),
+                        fail -> log.error("Failed to create Submission Result: {}", document)
+                );
+            }
+
+            for (SubmissionFile file : files) {
+                log.info("Financial Statement File: {}", file);
+
+                String fileName = FilenameUtils.getBaseName(file.getFilePath());
+
+                // Update Financial Statement Document
+                byte[] fileBytes = s3Service.getFileAsBytes(file.getFilePath());
+                PDDocument pdDocument = PDDocument.load(new ByteArrayInputStream(fileBytes));
+                UpdateDocument updateDocument = UpdateDocument.builder()
+                        .documentName(fileName)
+                        .totalPages((long) pdDocument.getNumberOfPages())
+                        .totalDocuments(1L)
+                        .status(SubmissionStatus.PROCESSING)
+                        .build();
+                pdDocument.close();
+
+                await(store.updateDocument(documentKey, updateDocument));
+                log.info("Financial Statement Document: {}", updateDocument);
+
+                // Update Profile
+                await(store.updateProfile(profileKey, UpdateProfile.builder()
+                        .status(SubmissionStatus.PENDING)
+                        .build())
+                );
+
+                // Start Financial Statement Parser
+                sqsService.startPdfPipeline(PdfPipelineProcess.builder()
+                        .key(file.getFilePath())
+                        .bucket(bucketName)
+                        .totalIndex(updateDocument.getTotalPages())
+                        .build());
+            }
+        } catch (Exception ex) {
+            log.error("Financial Statement Process [Exception]:", ex);
+            await(store.updateDocument(documentKey, UpdateDocument.builder().status(SubmissionStatus.FAILED).build()));
+        }
+    }
+
+    @SneakyThrows
+    @ConsumeEvent("FINANCIAL_STATEMENT_PARSER_COMPLETED")
+    @Blocking
+    public void TransformFinancialStatementResult(Message message) {
+        log.info("Financial Statement completed: {}", message.receiptHandle());
+
+        PdfPipelineMessage body = fromJson(message.body(), PdfPipelineMessage.class);
+        log.info("Financial Statement response body: {}", body);
+
+        List<String> segments = List.of(body.getKey().split("/"));
+        String orgId = segments.get(0);
+        String submissionId = segments.get(1);
+
+        SubmissionDocument document = await(store.getDocument(orgId, submissionId, Prefix.DOCUMENT_FINANCIAL_STATEMENT));
+        SubmissionProfile profile = await(store.getProfile(orgId, submissionId));
+
+        CompositeKey documentKey = CompositeKey.builder()
+                .pk(document.getPk())
+                .sk(document.getSk())
+                .build();
+
+        try {
+            // TODO: use "identifier" to get item instead of querying
+            Uni<List<SubmissionFile>> filesPromise = store.listFiles(
+                    document.getOrgId(), document.getSubmissionId(), Prefix.FILE_FINANCIAL_STATEMENT, SubmissionStatus.IN_REVIEW).collect().asList();
+
+            SubmissionFile file = await(filesPromise)
+                    .stream()
+                    .filter(_file -> _file.getFilePath().equals(body.getKey()))
+                    .findFirst()
+                    .get(); // shouldn't throw error at least for now (workflow haven't finalized yet)
+
+            String resultPath = AGGREGATED_JSON.apply(body.getKey());
+
+            // TODO: use separate queue for failed job to avoid reading the file from S3
+            String fileContent = s3Service.getFile(resultPath);
+
+            JsonNode parserResponse = getObjectMapper().readTree(fileContent);
+            boolean failed = false;
+
+            if (!parserResponse.get("code").asText().equals("0")) {
+                log.info("Financial Statement OCR failed");
+                failed = true;
+            }
+
+            long durationInSeconds = Duration.between(document.getUpdatedAt(), Instant.now()).getSeconds();
+            SubmissionStatus status = failed ? SubmissionStatus.FAILED : SubmissionStatus.IN_REVIEW;
+            String transformedPath = failed ? "" : TRANSFORMED_JSON.apply(document);
+
+            // Update Financial Statement Result
+            CompositeKey resultKey = CompositeKey.builder()
+                    .pk(file.getPk())
+                    .sk(DynamoUtil.replaceFilePrefix(file.getIdentifier(), Prefix.RESULT))
+                    .build();
+
+            await(store.updateResult(resultKey, UpdateResult.builder()
+                    .status(status)
+                    .durationInSeconds(durationInSeconds)
+                    .resultPath(resultPath)
+                    .build())
+            );
+
+            CompositeKey fileKey = CompositeKey.builder()
+                    .pk(file.getPk())
+                    .sk(file.getSk())
+                    .build();
+
+            await(store.updateFile(fileKey, UpdateFile.builder().status(status).build()));
+
+            // Update Financial Statement Document
+            await(store.updateDocument(documentKey, UpdateDocument.builder()
+                    .status(status)
+                    .transformedPath(transformedPath)
+                    .build())
+            );
+
+            // Invoke callbackUrl if provided
+            if (!Strings.isNullOrEmpty(profile.getCallbackUrl())) {
+                Map<String, ?> bodyMap = Map.of(
+                        "submissionId", profile.getSubmissionId(),
+                        "status", profile.getStatus()
+                );
+                httpService.send(profile.getCallbackUrl(), bodyMap);
+            }
+        } catch (Exception ex) {
+            log.error("Financial Statement Parser [Exception]:", ex);
+            await(store.updateDocument(documentKey, UpdateDocument.builder().status(SubmissionStatus.FAILED).build()));
+        } finally {
+            // Delete SQS message
+            sqsService.deleteCompletedPipelineMessage(message.receiptHandle());
+        }
+        for (SubmissionResult result : store.listResults(document.getOrgId(), document.getSubmissionId(), Prefix.RESULT_FINANCIAL_STATEMENT).collect().asList().await().indefinitely()) {
+            UpdateEntity updateEntity = UpdateEntity.builder()
+                    .entityUpdates(null)
+                    .documentType(DocumentType.FINANCIAL_STATEMENT)
+                    .identifier(result.getIdentifier())
+                    .build();
+            documentExtractionTemplateUtil.documentExtractionToTemplate(profile.getOrgId(), profile.getCreatedBy(), profile.getSubmissionId(), updateEntity);
+        }
+        s3Service.uploadJson("", PROCESSED_MARKER.apply(document));
+    }
+
+    @ConsumeEvent("FINANCIAL_STATEMENT_PARSER_FAILED")
+    @SneakyThrows
+    @Blocking
+    public void FailedFinancialStatementResult(Message message) {
+        log.info("Financial Statement failed: {}", message.receiptHandle());
+
+        PdfPipelineMessage body = fromJson(message.body(), PdfPipelineMessage.class);
+        log.info("Financial Statement failed response body: {}", body);
+
+        List<String> segments = List.of(body.getKey().split("/"));
+        String orgId = segments.get(0);
+        String submissionId = segments.get(1);
+
+        SubmissionDocument document = await(store.getDocument(orgId, submissionId, Prefix.DOCUMENT_FINANCIAL_STATEMENT));
+
+        // TODO: use "identifier" to get item instead of querying
+        Uni<List<SubmissionFile>> filesPromise = store.listFiles(
+                document.getOrgId(), document.getSubmissionId(), Prefix.FILE_FINANCIAL_STATEMENT, SubmissionStatus.IN_REVIEW).collect().asList();
+
+        SubmissionFile file = await(filesPromise)
+                .stream()
+                .filter(_file -> _file.getFilePath().equals(body.getKey()))
+                .findFirst()
+                .get(); // shouldn't throw error at least for now (workflow haven't finalized yet)
+
+        CompositeKey resultKey = CompositeKey.builder()
+                .pk(file.getPk())
+                .sk(DynamoUtil.replaceFilePrefix(file.getIdentifier(), Prefix.RESULT))
+                .build();
+
+        await(store.updateResult(resultKey, UpdateResult.builder()
+                .status(SubmissionStatus.FAILED)
+                .build())
+        );
+
+        sqsService.deleteFailedPipelineMessage(message.receiptHandle());
+    }
+}
+
